@@ -1,156 +1,287 @@
 import re
 import timeit
+import os
+import requests
+from urllib.request import urlretrieve, quote
+from urllib.parse import urlparse, unquote, urldefrag
+
 from multiprocessing.dummy import Pool
-from urllib import request
+from bs4 import BeautifulSoup
 
 import time
 
 
 def benchmark(func):
     def wrapped(*args, **kwargs):
-        print("function %s: " % func.__name__, end="")
+        print("--- Function \"%s\" called." % func.__name__)
         s = timeit.default_timer()
         ret = func(*args, **kwargs)
         e = timeit.default_timer()
-        print("%.10fs elapsed." % (e - s))
+        print("--- Function \"%s\" completed with %.10fs elapsed." % (func.__name__, e - s))
         return ret
 
     return wrapped
 
 
-class WebPageElemCrawler(object):
+class WebpageCrawler(object):
     """
     Web elements will be downloaded and stored on the disk
     """
+    web_encoding = "utf-8"
+    max_page_count = 16
+    interval = 4
 
-    threadCount = 5  # thread count
-    fprefix = "./" + __name__ + "/file"  # prefix of storing path
-    fsuffix = ".dat"  # suffix of a file
-    seconds = 2  # how long the time interval should be between two page crawling
-
-    # Caller should provide a pattern to find his desired url in web page.
-    # The intended url must be placed inside the closing parentheses in regex.
-    patElemUrl = None
-    # If proto is None, extractElemUrls() returns original urls matched by patElemUrl.
-    # Otherwise, a matched url is expected to start with "//" or proto. If it starts with "//"
-    # then a proto string is appended to its front end; if it starts with proto, nothing more will be added.
-    proto = "http"
-
-    maxPageCount = 16
-    maxElemCount = 1024
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
+                "Chrome/66.0.3359.181 Safari/537.36 "
 
     def __init__(self, *urls):
         """
 
         :param urls: iterable
         """
+        self.pending = list(urls)
+        self.visited = set()
+        self.url = None
+        self.page = None
 
-        self._currPage = 0
-        self._elemCount = 0
-        self._pageUrls = list(urls)
+    def open(self):
 
-    @benchmark
-    def readUrl(self, url):
-        return request.urlopen(url).read().decode("utf-8", "ignore")
+        response = requests.get(self.url, headers={"User-Agent": self.user_agent})
 
-    def extractPageUrls(self, page, no, url):
+        # Redirect is common and the final url might have been visited
+        # TODO should it get de-fragmented here?
+
+        self.url = urldefrag(response.url)[0]
+
+        if self.url not in self.visited:
+            page = response.content.decode("utf-8", "ignore")
+            self.visited.add(self.url)
+            return page
+
+    def get_next_full_urls(self):
         """
 
-        :param page: current page data
-        :param no: current page number
-        :param url: from which urls will be obtained and returned
-        :return: list of urls to be crawled in next turn
+        :return: list of full urls to be crawled in next turn
         """
         raise NotImplementedError
 
-    def extractElemUrls(self, page):
-        """
-
-        :param page: page data in string
-        :return: list of urls, each of which refers to a web page element
-        """
-        urls = self.patElemUrl.findall(page) if self.patElemUrl else []
-        return [(self.proto + ":" + url) if self.proto and not url.startswith(self.proto) else url for url in urls]
-
-    def keepCrawling(self):
+    def keep_crawling(self):
         """
 
         :return: whether we should stop crawling
         """
-        return self._pageUrls and self._currPage < self.maxPageCount and self._elemCount < self.maxElemCount
+        return self.pending and len(self.visited) < self.max_page_count
 
-    def crawlNextPage(self):
-        url = self._pageUrls.pop(0)
-        data = self.readUrl(url)
+    def crawl_next_page(self):
+        """
+        Pop and open a url from the pending url list.
 
-        self._pageUrls += self.extractPageUrls(data, self._currPage, url)
-        self._data = data
-        self._currPage += 1
+        :return: true if a new page is crawled
+        """
+        self.url = urldefrag(self.pending.pop(0))[0]
+        if self.url in self.visited:
+            return False
+
+        page = self.open()
+        if not page:
+            return False
+        self.page = page
+
+        new = self.get_next_full_urls()
+        for link in new:
+            link = urldefrag(link)[0]
+            if link not in self.visited:
+                self.pending.append(link)
+
+        return True
+
+    def handle_page(self):
+        """
+        Do something with the current page
+        :return:
+        """
+        raise NotImplementedError
+
+    def finish(self):
+        pass
+
+    @benchmark
+    def start(self):
+        while self.keep_crawling():
+            if self.crawl_next_page():
+                self.handle_page()
+                time.sleep(self.interval)
+        self.finish()
+
+
+class WebpageElemDownloader(WebpageCrawler):
+    thread_count = 4
+    max_elem_count = 1024
+    download_dir = "./%s/" % __name__
+    prefix = ""
+    suffix = ".dat"
+
+    def __init__(self, *urls):
+        super().__init__(*urls)
+        self.elem_count = 0
+
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+    def extract_elem_urls(self):
+        """
+        Extract full urls of elements from current page.
+
+        :return: list of full urls, each of which refers to a web page element
+        """
+        raise NotImplementedError
+
+    def keep_crawling(self):
+        return super().keep_crawling() and self.elem_count < self.max_elem_count
 
     @benchmark
     def _retrieveElems(self, urls, filenames):
-        pool = Pool(self.threadCount)
-        pool.starmap(request.urlretrieve, zip(urls, filenames))
+        pool = Pool(self.thread_count)
+        pool.starmap(urlretrieve, zip(urls, filenames))
 
-    def retrieveElems(self):
-        remain = self.maxElemCount - self._elemCount
-        urls = self.extractElemUrls(self._data)[:remain]
-        filenames = ["%s%d%s" % (self.fprefix, self._elemCount + i, self.fsuffix) for i in range(len(urls))]
+    def handle_page(self):
+        remain = self.max_elem_count - self.elem_count
+        prefix = self.download_dir + self.prefix
+        urls = self.extract_elem_urls()[:remain]
+        filenames = ["%s%d%s" % (prefix, self.elem_count + i, self.suffix) for i in range(len(urls))]
 
         self._retrieveElems(urls, filenames)
-        self._elemCount += len(urls)
+        self.elem_count += len(urls)
 
-    @benchmark
-    def startToEnd(self):
-        while self.keepCrawling():
-            self.crawlNextPage()
-            self.retrieveElems()
-            time.sleep(self.seconds)
+        print(f"[-] current page [{len(self.visited)}]; {len(urls)} downloaded; {self.elem_count} in total.")
 
 
-class TaobaoGetThumbnails(WebPageElemCrawler):
-    patElemUrl = re.compile(r'"pic_url":"(//.*?)"')
-    maxElemCount = 64
-    fsuffix = ".jpg"
+class TaobaoSearchResultThumbnails(WebpageElemDownloader):
+    elem_url_regex = re.compile('"pic_url":"//(.*?)"')
+    max_elem_count = 64
+    download_dir = "./test/data/taobao/"
+    suffix = ".jpg"
 
-    def __init__(self, keyword):
-        self.firstUrl = "https://s.taobao.com/search?q=" + request.quote(keyword)
-        self.keyword = keyword
-        super().__init__(self.firstUrl)
+    def __init__(self, keyword, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-        self.fprefix = "./test/data/taobao/" + keyword
+        self.query = "https://s.taobao.com/search?q=" + quote(keyword)
+        self.prefix = keyword
+        super().__init__(self.query)
 
-    def extractPageUrls(self, page, no, url):
-        return [self.firstUrl + "&s=" + str(no * 44)]
+    def get_next_full_urls(self):
+        no = len(self.visited)
+        return [self.query + "&s=" + str(no * 44)]
 
-    def extractElemUrls(self, page):
-        urls = super().extractElemUrls(page)
-        return [url + "_180x180.jpg" for url in urls]
-
-
-class JdGetThumbnails(WebPageElemCrawler):
-    patElemUrl = re.compile(r'width="220" height="220".*src="(//.*?)"')
-    maxElemCount = 64
-    fsuffix = ".jpg"
-
-    def __init__(self, keyword):
-        self.firstUrl = "https://search.jd.com/Search?keyword=" + request.quote(keyword) + "&enc=utf-8"
-        self.keyword = keyword
-        super().__init__(self.firstUrl)
-
-        self.fprefix = "./test/data/jd/" + keyword
+    def extract_elem_urls(self):
+        urls = self.elem_url_regex.findall(self.page)
+        return [f"http://{url}_180x180.jpg" for url in urls]
 
 
-    def extractPageUrls(self, page, no, url):
-        return [self.firstUrl + "&page=" + str(no * 2 - 1)]
+class JdSearchResultThumbnails(WebpageElemDownloader):
+    elem_url_regex = re.compile('width="220" height="220".*source-data-lazy-img="//(.+\.jpg)"')
+    max_elem_count = 64
+    suffix = ".jpg"
+    download_dir = "./test/data/jd/"
+
+    def __init__(self, keyword, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+        self.query = "https://search.jd.com/Search?keyword=" + quote(keyword) + "&enc=utf-8"
+        self.prefix = keyword
+        super().__init__(self.query)
+
+    def extract_elem_urls(self):
+        img_sources = self.elem_url_regex.findall(self.page)
+        return ["http://" + src for src in img_sources]
+
+    def get_next_full_urls(self):
+        no = len(self.visited)
+        return [self.query + "&page=" + str(no * 2 - 1)]
+
+# The "Html fragments" feature appears in at least two ways.
+# Firstly, the link referring to a different part its original webpage contains a "#".
+# Secondly, the link referring to another webpage might be a redirection to a part of destination page.
+
+
+class ENWikiText(WebpageCrawler):
+    parenthesis_regex = re.compile('\(.+?\)')  # to remove parenthesis content
+    citations_regex = re.compile('\[.+?\]')  # to remove citations, e.g. [1]
+
+    download_dir = "./test/data/ENWiki/"
+    basic_url = "https://en.wikipedia.org/wiki/"
+
+    def __init__(self, keyword, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+        super().__init__(self.basic_url + quote(keyword))
+
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+        self.step = (self.max_page_count // 10) or self.max_page_count
+
+    def get_next_full_urls(self):
+        soup = BeautifulSoup(self.page, "html.parser")
+        content = soup.find("div", {"id": "mw-content-text"})
+
+        urls = []
+        for a in content.find_all("a"):
+            href = a.get("href")
+            if not href:
+                continue
+            elif not href.startswith("/wiki/"):  # allow only article pages
+                continue
+            elif href[-4:] in ".png .jpg .jpeg .svg":  # ignore image files inside articles
+                continue
+            urls.append(self.basic_url + href[6:])
+
+        self.main_content_text = content
+        return urls
+
+    def handle_page(self):
+        _, _, path, _, _, _ = urlparse(self.url)
+        keyword = unquote(path.rsplit("/", 1)[1])
+
+        paragraphs = self.main_content_text.find_all("p")
+
+        file_output = self.download_dir + keyword + ".txt"
+
+        with open(file_output, mode="w", encoding="utf-8") as f:
+            for p in paragraphs:
+                text = p.get_text().strip()
+                text = self.parenthesis_regex.sub("", text)
+                text = self.citations_regex.sub("", text)
+                if text:
+                    f.write(text + "\n\n")
+
+        count = len(self.visited)
+        if count % self.step == 0:
+            print("[-] %d/%d crawled." % (count, self.max_page_count))
+
 
 
 @benchmark
-def test():
+def test_downloader():
     keyword = "女雪地靴"
-    JdGetThumbnails(keyword).startToEnd()
-    TaobaoGetThumbnails(keyword).startToEnd()
+    crawler = JdSearchResultThumbnails(keyword,
+                                       download_dir="./data/jd/",
+                                       max_elem_count=1024,
+                                       max_page_count=50
+                                       )
+    crawler.start()
+
+
+@benchmark
+def test_crawler():
+    keyword = "Arya_Stark"
+    crawler = ENWikiText(keyword, max_page_count=50)
+    crawler.start()
 
 
 if __name__ == '__main__':
-    test()
+    # test_downloader()
+    test_crawler()
